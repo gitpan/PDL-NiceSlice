@@ -13,7 +13,8 @@ package PDL::NiceSlice;
 # Modified 2-Oct-2001: don't modify $var(LIST) if it's part of a
 # "for $var(LIST)" or "foreach $var(LIST)" statement.  CED.
 
-$PDL::NiceSlice::VERSION = 0.91;
+$PDL::NiceSlice::VERSION = 0.99;
+$PDL::NiceSlice::debug = 0;
 
 require PDL::Version; # get PDL version number
 if ("$PDL::Version::VERSION" !~ /cvs$/ and
@@ -37,20 +38,27 @@ eval << 'EOH';
     sub PDL::nslice {
       my($pdl) = shift;
       my @args = @_;
-      my $i = 0;
+      my ($i,$noslice) = (0,0);
       for (@args) {
 	if (UNIVERSAL::isa($_,'PDL')) {
 	  if ($_->nelem > 1) {
-	    PDL::Core::barf('piddle must be <= 1D') if $_->getndims > 1;
-	    # dice this axis
-	    $pdl = $pdl->dice_axis($i,$_);
-	    # and keep resulting dim fully in slice
-	    $_ = 'X'; } 
-	  else { $_ = $_->flat->at(0) } # reduce this one-element piddle
-	  # to a scalar for 'slice'
+	    if ($_->getndims > 1) {
+	      # allow one multi-D arg which will imply flat addressing
+	      PDL::Core::barf 'piddle must be <= 1D' if @args > 1;
+	      $pdl = $pdl->flat->index($_);
+	      $noslice = 1;
+	    } else {
+	      # dice this axis
+	      $pdl = $pdl->dice_axis($i,$_);
+	      # and keep resulting dim fully in slice
+	      $_ = 'X'; 
+	    }
+	  } else { $_ = $_->flat->at(0) } # reduce this one-element piddle
+					# to a scalar for 'slice'
 	}
 	$i++;
       }
+      return $pdl if $noslice;
       # print STDERR 'processed arglist: ',join(',',@args);
       my $slstr = join ',',(map {
 	!ref $_ && $_ eq "X" ? ":" :
@@ -113,7 +121,7 @@ my $prebrackreg = qr/^([^\(\{\[]*)/;
 # but ignore bracket-protected bits
 # (i.e. text that is within matched brackets)
 sub splitprotected ($$) {
-  my ($txt,$re) = @_;
+  my ($re,$txt) = @_;
   my ($got,$pre) = (1,'');
   my @chunks = ('');
   my $ct = 0; # infinite loop protection
@@ -152,12 +160,13 @@ my $prefixpat = qr/.*?  # arbitrary leading stuff
 # mslice format
 sub onearg ($) {
   my ($arg) = @_;
+  print STDERR "processing arg $arg\n" if $PDL::NiceSlice::debug;
   return q|'X'| if $arg =~ /^\s*:??\s*$/;     # empty arg or just colon
   # recursively process args for slice syntax
   $arg = findslice($arg,$PDL::debug) if $arg =~ $prefixpat;
   # no doubles colon are matched to avoid confusion with Perl's C<::>
-  if ($arg =~ /(?<!:):(?!:)/) {
-    my @args = splitprotected $arg, '(?<!:):(?!:)';
+  if ($arg =~ /(?<!:):(?!:)/) { # a start:stop:delta range
+    my @args = splitprotected '(?<!:):(?!:)', $arg;
     filterdie "invalid range in slice expression '".curarg()."'"
       if @args > 3;
     $args[0] = 0 if !defined $args[0] || $args[0] =~ /^\s*$/;
@@ -167,7 +176,7 @@ sub onearg ($) {
   }
   # the (pos) syntax, i.e. 0D slice
   return "[$arg,0,0]" if $arg =~ s/^\s*\((.*)\)\s*$/$1/; # use the new [x,x,0]
-  # we don't allow [] syntax (although that's what mslice uses)
+  # we don't allow [] syntax (although that's what nslice internally uses)
   filterdie "invalid slice expression containing '[', expression was '".
     curarg()."'" if $arg =~ /^\s*\[/;
   # this must be a simple position, leave as is
@@ -177,17 +186,18 @@ sub onearg ($) {
 # process the arg list
 sub procargs {
   my ($txt) = @_;
-  $txt =~ s/\((.*)\)/$1/s;
+  print STDERR "procargs: got $txt\n" if $PDL::NiceSlice::debug;
+  # $txt =~ s/^\s*\((.*)\)\s*$/$1/s; # this is now done by findslice
   # push @callstack, $txt; # for later error reporting
   my $args = $txt =~ /^\s*$/s ? '' :
-    join ',', map {onearg $_} splitprotected $txt, ',';
+    join ',', map {onearg $_} splitprotected ',', $txt;
   $args =~ s/\s//sg; # get rid of whitespace
   # pop @callstack; # remove from call stack
   return "($args)";
 }
 
 # this is the real workhorse that translates occurences
-# of $a(args) into $args->mslice(processed_arglist)
+# of $a(args) into $args->nslice(processed_arglist)
 #
 sub findslice {
   my ($src,$verb) = @_;
@@ -206,40 +216,75 @@ sub findslice {
 #  Process into an 'nslice' call only if it's not that.
 
     if($prefix =~ m/for(each)?(\s+(my|our))?\s+\$\w+$/s) {
-      $processed .= "$prefix".$found;       # foreach statement: Don't translate 
-
+      # foreach statement: Don't translate
+      $processed .= "$prefix".$found;
     } else {      # statement is a real slice and not a foreach
-      
-      my ($mod,$call,$arg,$post);
-      
+
+      my ($call,$pre,$post,$arg);
+
+      # the following section got an overhaul in v0.99
+      # to fix modifier parsing and allow >1 modifier
+      # this code still needs polishing
       savearg $found; # error reporting
-      
-      filterdie "invalid modifier $1"
-	if $found =~ /(;\s*[[:graph:]]{2,}?\s*)\)$/;
-      if ($found =~ s/;\s*(\S)\s*\)$/\)/) { # check for trailing modifiers
-	$mod = $1;
-	if ($mod eq '?') {
-	  $call = 'where';
-	  $arg = $found;
-	  $post = '';
-	} elsif ($mod eq '_') {
-	  $call = 'flat->nslice';
-	  $arg = procargs($found);
-	  $post = '';
-	} elsif ($mod eq '|') {
+      print STDERR "findslice: found $found\n" if $PDL::NiceSlice::debug;
+      $found =~ s/^\s*\((.*)\)\s*$/$1/s;
+      my ($slicearg,@mods) = splitprotected ';', $found;
+      filterdie "more than 1 modifier group: @mods" if @mods > 1;
+      # filterdie "invalid modifier $1"
+      #	if $found =~ /(;\s*[[:graph:]]{2,}?\s*)\)$/;
+      print STDERR "MODS: @mods\n" if $PDL::NiceSlice::debug;
+      my @post = (); # collects all post nslice operations
+      my @pre = ();
+      if (@mods) {
+	(my $mod = $mods[0]) =~ s/\s//sg; # eliminate whitespace
+	my @modflags = split '', $mod;
+	print STDERR "MODFLAGS: @modflags\n" if $PDL::NiceSlice::debug;
+	filterdie "more than 1 modifier incompatible with ?: @modflags"
+	  if @modflags > 1 && grep (/\?/, @modflags); # only one flag with where
+	my %seen = ();
+	if (@modflags) {
+	  for my $mod1 (@modflags) {
+	    if ($mod1 eq '?') {
+	      $seen{$mod1}++ && filterdie "modifier $mod1 used twice or more";
+	      $call = 'where';
+	      $arg = "($slicearg)";
+	      # $post = ''; # no post action required
+	    } elsif ($mod1 eq '_') {
+	      $seen{$mod1}++ && filterdie "modifier $mod1 used twice or more";
+	      push @pre, 'flat->';
+	      $call ||= 'nslice';       # do only once
+	      $arg = procargs($slicearg);
+	      # $post = ''; # no post action required
+	    } elsif ($mod1 eq '|') {
+	      $seen{$mod1}++ && filterdie "modifier $mod1 used twice or more";
+	      $call ||= 'nslice';
+	      $arg ||= procargs($slicearg);
+	      push @post, '->sever';
+	    } elsif ($mod1 eq '-') {
+	      $seen{$mod1}++ && filterdie "modifier $mod1 used twice or more";
+	      $call ||= 'nslice';
+	      $arg ||= procargs($slicearg);
+	      push @post, '->reshape(-1)';
+	    } else {
+	      filterdie "unknown modifier $mod1";
+	    }
+	  }
+	} else { # empty modifier block
 	  $call = 'nslice';
-	  $arg = procargs($found);
-	  $post = '->sever';
-	} else {
-	  filterdie "unknown modifier $mod";
+	  $arg = procargs($slicearg);
+	  # $post = '';
 	}
-      } else {
+      } else { # no modifier block
 	$call = 'nslice';
-	$arg = procargs($found);
-	$post = '';
+	$arg = procargs($slicearg);
+	# $post = '';
       }
+      $pre = join '', @pre;
+      # assumption here: sever should be last
+      # and order of other modifiers doesn't matter
+      $post = join '', sort @post; # need to ensure that sever is last
       $processed .= "$prefix". ($prefix =~ /->$/ ? '' : '->').
-	$call.$arg.$post.$mypostfix;
+	$pre.$call.$arg.$post.$mypostfix;
     }
 
   } # end of while loop
@@ -261,10 +306,10 @@ sub perldlpp {
  if ($@) {
    my $err = $@;
    for (split '','#!|\'"%~/') {
-     return "print q${_}preprocessor error: $err${_}"
+     return "print q${_}NiceSlice error: $err${_}"
        unless $err =~ m{[$_]};
     }
-   return "print q{preprocessor error: $err}"; # if this doesn't work
+   return "print q{NiceSlice error: $err}"; # if this doesn't work
                                                # we're stuffed
  }
  return $new;
@@ -327,13 +372,17 @@ PDL::NiceSlice - toward a nicer slicing syntax for PDL
   $a(myfunc(0,$var),1:4)++; # when using functions in slice expressions
                             # use parentheses around args!
 
-  # modifiers
+  # modifiers are specified in a ;-separated trailing block
   $a($a!=3;?)++;            # short for $a->where($a!=3)++
   $a(0:1114;_) .= 0;        # short for $a->flat->(0:1114)
   $b = $a(0:-1:3;|);        # short for $a(0:-1:3)->sever
+  $n = sequence 3,1,4,1;
+  $b = $n(;-);              # drop all dimensions of size 1 (AKA squeeze)
+  $b = $n(0,0;-|);          # squeeze *and* sever
+  $c = $a(0,3,0;-);         # more compact way of saying $a((0),(3),(0))
 
   # Use with perldl versions < v1.31 (or include these lines in .perldlrc)
-  perldl> use PDL::NiceSlice; 
+  perldl> use PDL::NiceSlice;
   # next one is required, see below
   perldl> $PERLDL::PREPROCESS = \&PDL::NiceSlice::perldlpp;
   perldl> $a(4:5) .= xvals(2);
@@ -453,10 +502,11 @@ section below).
 =head2 Usage with perldl
 
 I<NOTE>: This information only applies to versions of
-L<perldl|perldl> smaller than 1.31 . From v1.31 onwards
-niceslicing is enabled by default. See L<perldl> for details.
+L<perldl|perldl> earlier than 1.31 . From v1.31 onwards
+niceslicing is enabled by default, i.e.
+I<it should just work>. See L<perldl> for details.
 
-To use the filter in the C<perldl> shell you need to
+For pre v1.31 C<perldl>s you need to
 add the following two lines to your F<.perldlrc> file:
 
    use PDL::NiceSlice;
@@ -478,6 +528,8 @@ Similarly, switch reporting off as needed
 
 Note that these commands will only work if you included
 the contents of F<local.perldlrc> in your perldl startup file.
+In C<perldl> v1.31 and later these commands are available by
+default.
 
 =head2 evals and C<PDL::NiceSlice>
 
@@ -673,13 +725,13 @@ on PDL slicing. The general syntax is
 
     $pdl(<slice>;<modifier>)
 
-Three modifiers are currently implemented:
+Four modifiers are currently implemented:
 
 =over
 
 =item *
 
-C<_>: flatten the piddle before applying the slice expression. Here
+C<_> : I<flatten> the piddle before applying the slice expression. Here
 is an example
 
    $b = sequence 3, 3;
@@ -697,7 +749,7 @@ which is quite different from the same slice expression without the modifier
 
 =item *
 
-C<|>: L<sever|PDL::Core/sever> the link to the piddle, e.g.
+C<|> : L<sever|PDL::Core/sever> the link to the piddle, e.g.
 
    $a = sequence 10;
    $b = $a(0:2;|)++;  # same as $a(0:2)->sever++
@@ -708,7 +760,7 @@ C<|>: L<sever|PDL::Core/sever> the link to the piddle, e.g.
 
 =item *
 
-C<?>: short hand to indicate that this is really a
+C<?> : short hand to indicate that this is really a
 L<where|PDL::Primitive/where> expression
 
 As expressions like
@@ -730,12 +782,49 @@ For example, the following code will raise an error:
 
 That's about all there is to know about this one.
 
+=item *
+
+C<-> : I<squeeze> out any singleton dimensions. In less technical terms:
+reduce the number of dimensions (potentially) by deleting all
+dims of size 1. It is equivalent to doing a L<reshape|PDL::Core/reshape>(-1).
+That can be very handy if you want to simplify
+the results of slicing operations:
+
+  $a = ones 3, 4, 5;
+  $b = $a(1,0;-); # easier to type than $a((1),(0))
+  print $b->info;
+ PDL: Double D [5]
+
+It also provides a unique opportunity to have smileys in your code!
+Yes, PDL gives new meaning to smileys.
+
 =back
 
-Modifiers are a new and experimental feature of C<PDL::NiceSlice>. So
-don't be surprised if things don't work quite as expected.
-Feedback is welcome as usual. The modifier syntax may change
-in the future.
+=head2 Combining modifiers
+
+Several modifiers can be used in the same expression, e.g.
+
+  $c = $a(0;-|); # squeeze and sever
+
+Other combinations are just as useful, e.g. C<;_|> to flatten and
+sever. The sequence in which modifiers are specified is not important.
+
+A notable exception is the C<where> modifier (C<?>) which must not
+be combined with other flags (let me know if you see a good reason
+to relax this rule).
+
+Repeating any modifier will raise an error:
+
+  $c = $a(-1:1;|-|); # will cause error
+ NiceSlice error: modifier | used twice or more
+
+Modifiers are still a new and experimental feature of
+C<PDL::NiceSlice>. I am not sure how many of you are actively using
+them. I<Please do so and experiment with the syntax>. I think
+modifiers are very useful and make life a lot easier.  Feedback is
+welcome as usual. The modifier syntax will likely be further tuned in
+the future but we will attempt to ensure backwards compatibility
+whenever possible.
 
 =head2 Argument formats
 
@@ -976,7 +1065,7 @@ E<lt>pdl-porters@jach.hawaii.eduE<gt>.
 
 =head1 COPYRIGHT
 
-Copyright (c) 2001, Christian Soeller. All Rights Reserved.
+Copyright (c) 2001, 2002 Christian Soeller. All Rights Reserved.
 This module is free software. It may be used, redistributed
 and/or modified under the same terms as PDL itself
 (see http://pdl.perl.org).
