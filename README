@@ -29,6 +29,8 @@ SYNOPSYS
       $idx = long 1, 7, 3, 0;   # a piddle of indices
       $a(-3:2:2,$idx) += 3;     # mix explicit indexing and ranges
 
+      $a($a!=3;?)++;            # short for $a->where($a!=3)++
+
 DESCRIPTION
     `PDL''s slice syntax sucks. This module tries to rectify the situation
     to some degree. Using Perl's ability to use *source filtering* (which
@@ -137,8 +139,9 @@ The new slicing syntax
 
     The argument list is a comma separated list. Each argument specifies how
     the corresponding dimension in the piddle is sliced. In contrast to
-    usage of slice the arguments should not be quoted. Rather freely mix
-    literals (1,3,etc), perl variabales and function invocations, e.g.
+    usage of the slice method the arguments should *not* be quoted. Rather
+    freely mix literals (1,3,etc), perl variabales and function invocations,
+    e.g.
 
       $a($pos-1:$end,myfunc(1,3)) .= 5;
 
@@ -168,9 +171,85 @@ The new slicing syntax
     this stage the source filter is simply not intelligent enough to make
     use of this information. So beware of this subtlety.
 
+    Another pitfall to be aware of: currently, you can't use the conditional
+    operator in slice expressions (i.e., `?:', since the parser confuses
+    them with ranges). For example, the following will cause an error:
+
+      $a = sequence 10;
+      $b = rand > 0.5 ? 0 : 1; # this one is ok
+      print $a($b ? 1 : 2);    # error !
+     syntax error at (eval 59) line 3, near "1,
+
+    For the moment, just try to stay clear of the conditional operator in
+    slice expressions (or provide us with a patch to the parser to resolve
+    this issue ;).
+
+  Modifiers
+
+    Following a suggestion originally put forward by Karl Glazebrook the
+    latest versions of `PDL::NiceSlice' implement *modifiers* in slice
+    expressions. Modifiers are convenient shorthands for common variations
+    on PDL slicing. The general syntax is
+
+        $pdl(<slice>;<modifier>)
+
+    Three modifiers are currently implemented:
+
+    *   `_': flatten the piddle before applying the slice expression. Here
+        is an example
+
+           $b = sequence 3, 3;
+           print $b(0:-2;_); # same as $b->flat->(0:-2)
+         [0 1 2 3 4 5 6 7]
+
+        which is quite different from the same slice expression without the
+        modifier
+
+           print $b(0:-2);
+         [
+          [0 1]
+          [3 4]
+          [6 7]
+         ]
+
+    *   `|': sever the link to the piddle, e.g.
+
+           $a = sequence 10;
+           $b = $a(0:2;|);  # same as $a(0:2)->sever
+           $b++;
+           print $a; # check if $a has been modified
+         [0 1 2 3 4 5 6 7 8 9]
+
+    *   `?': short hand to indicate that this is really a where expression
+
+        As expressions like
+
+          $a->where($a>5)
+
+        are used very often you can write that shorter as
+
+          $a($a>5;?)
+
+        With the `?'-modifier the expression preceding the modifier is *not*
+        really a slice expression (e.g. ranges are not allowed) but rather
+        an expression as required by the where method. For example, the
+        following code will raise an error:
+
+          $a = sequence 10;
+          print $a(0:3;?);
+         syntax error at (eval 70) line 3, near "0:"
+
+        That's about all there is to know about this one.
+
+    Modifiers are a pretty new feature of `PDL::NiceSlice'. So don't be
+    surprised if things don't work quite as expected. Feedback is welcome as
+    usual. The modifier syntax may change in the future.
+
   Argument formats
 
-    You can use ranges and secondly, piddles as 1D index lists.
+    In slice expressions you can use ranges and secondly, piddles as 1D
+    index lists (although compare the description of the `?'-modifier for
+    exceptions).
 
     * ranges
       You can access ranges using the usual `:' separated format:
@@ -398,9 +477,35 @@ Implementation
     Full documentation of `nslice' will be in the next PDL release.
 
 BUGS
-    Error checking is probably not yet foolproof. Feedback and bug reports
-    are welcome. Please include an example that demonstrates the problem.
-    Log bug reports in the PDL bug database at
+    Error checking is probably not yet foolproof.
+
+    The conditional operator can't be used in slice expressions (see above).
+
+    There is currently an undesired interaction between `PDL::NiceSlice' and
+    the new Inline::Pdlpp module (currently only in PDL CVS). Since PP code
+    generally contains expressions of the type `$var()' (to access piddles,
+    etc) `PDL::NiceSlice' recognizes those incorrectly as slice expressions
+    and does its substitutions. For the moment (until hopefully the parser
+    can deal with that) it is best to explicitly switch `PDL::NiceSlice' off
+    before the section of inlined Pdlpp code. For example:
+
+      use PDL::NiceSlice;
+      use Inline::Pdlpp;
+
+      $a = sequence 10;
+      $a(0:3)++;
+      $a->inc;
+
+      no PDL::NiceSlice;
+
+      __DATA__
+
+      __C__
+
+      ppdef (...); # your full pp definition here
+
+    Feedback and bug reports are welcome. Please include an example that
+    demonstrates the problem. Log bug reports in the PDL bug database at
 
       http://sourceforge.net/bugs/?group_id=612
 

@@ -10,7 +10,7 @@ package PDL::NiceSlice;
 #   $pdl->mslice(processed_args);
 #
 
-$PDL::NiceSlice::VERSION = 0.6;
+$PDL::NiceSlice::VERSION = 0.7;
 
 require PDL::Version; # get PDL version number
 if ("$PDL::Version::VERSION" !~ /cvs$/ and
@@ -70,8 +70,12 @@ use Text::Balanced; # used to find parenthesis-delimited blocks
 # a call stack for error processing
 my @callstack = ('stackbottom');
 sub curarg {
-  return $callstack[-1]; # return top element of stack
+  my $arg = $callstack[-1]; # return top element of stack
+  $arg =~ s/\((.*)\)/$1/s;
+  return $arg;
 }
+sub savearg ($) {push @callstack,$_[0]}
+sub poparg () {pop @callstack}
 
 my @srcstr = (); # stack for refs to current source strings
 my $offset = 1;  # line offset
@@ -171,11 +175,11 @@ sub onearg ($) {
 sub procargs {
   my ($txt) = @_;
   $txt =~ s/\((.*)\)/$1/s;
-  push @callstack, $txt; # for later error reporting
+  # push @callstack, $txt; # for later error reporting
   my $args = $txt =~ /^\s*$/s ? '' :
     join ',', map {onearg $_} splitprotected $txt, ',';
   $args =~ s/\s//sg; # get rid of whitespace
-  pop @callstack; # remove from call stack
+  # pop @callstack; # remove from call stack
   return "($args)";
 }
 
@@ -189,16 +193,46 @@ sub findslice {
   my $processed = '';
   my $ct=0; # protect against infinite loop
   my ($found,$prefix,$dummy);
-  while ( (($found,$dummy,$prefix) = 
+  while ( $src =~ m/\G($prefixpat)/ && (($found,$dummy,$prefix) =
 	   Text::Balanced::extract_bracketed($src,'()',$prefixpat))[0]
 	  && $ct++ < 1000) {
     print STDERR "pass $ct: found slice expr $found at line ".line()."\n"
       if $verb;
+    my ($mod,$call,$arg,$post);
+    savearg $found; # error reporting
+    filterdie "invalid modifier $1"
+      if $found =~ /(;\s*[[:graph:]]{2,}?\s*)\)$/;
+    if ($found =~ s/;\s*(\S)\s*\)$/\)/) { # check for trailing modifiers
+      $mod = $1;
+      if ($mod eq '?') {
+	$call = 'where';
+	$arg = $found;
+	$post = '';
+      } elsif ($mod eq '_') {
+	$call = 'flat->nslice';
+	$arg = procargs($found);
+	$post = '';
+      } elsif ($mod eq '|') {
+	$call = 'nslice';
+	$arg = procargs($found);
+	$post = '->sever';
+      } else {
+	filterdie "unknown modifier $mod";
+      }
+    } else {
+      $call = 'nslice';
+      $arg = procargs($found);
+      $post = '';
+    }
     $processed .= "$prefix". ($prefix =~ /->$/ ? '' : '->').
-      'nslice'.procargs($found).$mypostfix;
+      $call.$arg.$post.$mypostfix;
   }
+  poparg;      # clean stack
   pop @srcstr; # clear stack
-  $processed .= substr $src, pos($src); # append the remaining text portion
+  # append the remaining text portion
+  #     use substr only if we have had at least one pass
+  #     through above loop (otherwise pos is uninitialized)
+  $processed .= $ct > 0 ? substr $src, pos($src) : $src;
 }
 
 
@@ -207,14 +241,37 @@ sub perldlpp {
  my ($txt) = @_;
  my $new;
  eval '$new = PDL::NiceSlice::findslice $txt';
- return "print q|preprocessor error: $@|" if $@;
+ if ($@) {
+   my $err = $@;
+   for (split '','#!|\'"%~/') {
+     return "print q${_}preprocessor error: $err${_}"
+       unless $err =~ m{[$_]};
+    }
+   return "print q{preprocessor error: $err}"; # if this doesn't work
+                                               # we're stuffed
+ }
  return $new;
 }
 
 # use Damian Conway's simplified source filter interface
 use Filter::Simple sub {
-   $_ = findslice $_;
- };
+  # print STDERR "entering Filter...\n";
+  # print STDERR;
+  # unless (m/$prefixpat/) {
+    # print STDERR "got that ->\n";
+    # print STDERR;
+    # print STDERR "leaving prematurely\n";
+    # print $@;
+  #  return;
+  # };
+  $_ = findslice $_;
+  # print STDERR "After\n\n";
+  # print STDERR;
+  # print STDERR "status: $@\n";
+  # print STDERR "leaving Filter...\n";
+};
+# stay clear of __END__ and __DATA__ sections
+# => qr/^\s*(__(END|DATA)__)|(no\s+PDL::NiceSlice\s*;)\s*$/;
 
 # well it is not quite that simple ;)
 #  since Filter::Simple doesn't have all the bells and whistles yet
@@ -244,6 +301,8 @@ PDL::NiceSlice - toward a nicer slicing syntax for PDL
   
   $idx = long 1, 7, 3, 0;   # a piddle of indices
   $a(-3:2:2,$idx) += 3;     # mix explicit indexing and ranges
+
+  $a($a!=3;?)++;            # short for $a->where($a!=3)++
 
 =head1 DESCRIPTION
 
@@ -363,9 +422,9 @@ Similarly, if you have a list of piddles C<@pdls>:
 
 The argument list is a comma separated list. Each argument specifies
 how the corresponding dimension in the piddle is sliced. In contrast
-to usage of L<slice|PDL::Slices/slice> the arguments should not be
-quoted. Rather freely mix literals (1,3,etc), perl variabales and
-function invocations, e.g.
+to usage of the L<slice|PDL::Slices/slice> method the arguments should
+I<not> be quoted. Rather freely mix literals (1,3,etc), perl
+variabales and function invocations, e.g.
 
   $a($pos-1:$end,myfunc(1,3)) .= 5;
 
@@ -397,9 +456,96 @@ Note that using prototypes in the definition of myfunc does not help.
 At this stage the source filter is simply not intelligent enough to
 make use of this information. So beware of this subtlety.
 
+Another pitfall to be aware of: currently, you can't use the conditional
+operator in slice expressions (i.e., C<?:>, since the parser confuses them
+with ranges). For example, the following will cause an error:
+
+  $a = sequence 10;
+  $b = rand > 0.5 ? 0 : 1; # this one is ok
+  print $a($b ? 1 : 2);    # error !
+ syntax error at (eval 59) line 3, near "1,
+
+For the moment, just try to stay clear of the conditional operator
+in slice expressions (or provide us with a patch to the parser to
+resolve this issue ;).
+
+=head2 Modifiers
+
+Following a suggestion originally put forward by Karl Glazebrook the
+latest versions of C<PDL::NiceSlice> implement I<modifiers> in slice
+expressions. Modifiers are convenient shorthands for common variations
+on PDL slicing. The general syntax is
+
+    $pdl(<slice>;<modifier>)
+
+Three modifiers are currently implemented:
+
+=over
+
+=item *
+
+C<_>: flatten the piddle before applying the slice expression. Here
+is an example
+
+   $b = sequence 3, 3;
+   print $b(0:-2;_); # same as $b->flat->(0:-2)
+ [0 1 2 3 4 5 6 7]
+
+which is quite different from the same slice expression without the modifier
+
+   print $b(0:-2);
+ [
+  [0 1]
+  [3 4]
+  [6 7]
+ ]
+
+=item *
+
+C<|>: L<sever|PDL::Core/sever> the link to the piddle, e.g.
+
+   $a = sequence 10;
+   $b = $a(0:2;|);  # same as $a(0:2)->sever
+   $b++;
+   print $a; # check if $a has been modified
+ [0 1 2 3 4 5 6 7 8 9]
+
+=item *
+
+C<?>: short hand to indicate that this is really a
+L<where|PDL::Primitive/where> expression
+
+As expressions like
+
+  $a->where($a>5)
+
+are used very often you can write that shorter as
+
+  $a($a>5;?)
+
+With the C<?>-modifier the expression preceding the modifier is I<not>
+really a slice expression (e.g. ranges are not allowed) but rather an
+expression as required by the L<where|PDL::Primitive/where> method.
+For example, the following code will raise an error:
+
+  $a = sequence 10;
+  print $a(0:3;?);
+ syntax error at (eval 70) line 3, near "0:"
+
+That's about all there is to know about this one.
+
+=back
+
+Modifiers are a pretty new feature of C<PDL::NiceSlice>. So
+don't be surprised if things don't work quite as expected.
+Feedback is welcome as usual. The modifier syntax may change
+in the future.
+
 =head2 Argument formats
 
-You can use ranges and secondly, piddles as 1D index lists.
+In slice expressions you can use ranges and secondly,
+piddles as 1D index lists (although compare the description
+of the C<?>-modifier for exceptions).
 
 =over 2
 
@@ -645,6 +791,35 @@ be in the next PDL release.
 =head1 BUGS
 
 Error checking is probably not yet foolproof.
+
+The conditional operator can't be used in slice expressions (see
+above).
+
+There is currently an undesired interaction between C<PDL::NiceSlice>
+and the new L<Inline::Pdlpp|Inline::Pdlpp> module (currently only in 
+PDL CVS). Since PP code generally
+contains expressions of the type C<$var()> (to access piddles, etc)
+C<PDL::NiceSlice> recognizes those incorrectly as
+slice expressions and does its substitutions. For the moment
+(until hopefully the parser can deal with that) it is best to
+explicitly switch C<PDL::NiceSlice> off before the section of
+inlined Pdlpp code. For example:
+
+  use PDL::NiceSlice;
+  use Inline::Pdlpp;
+
+  $a = sequence 10;
+  $a(0:3)++;
+  $a->inc;
+
+  no PDL::NiceSlice;
+
+  __DATA__
+
+  __C__
+
+  ppdef (...); # your full pp definition here
+
 Feedback and bug reports are welcome. Please include an example
 that demonstrates the problem. Log bug reports in the PDL
 bug database at
