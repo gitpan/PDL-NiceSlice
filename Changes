@@ -1,3 +1,10 @@
+0.8
+ - modifiers
+ - fix error bug (reported by Doug Burke)
+ - fix foreach/for $a(LIST) problem (CED)
+ - docs clarification
+0.7
+ - docs
 0.6
  - doc updates
  - declare nslice lvalue sub if perl version >= 5.6.0
